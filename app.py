@@ -1,39 +1,34 @@
-from fastapi import FastAPI, Form
-import requests, time, openai, os
+from fastapi import FastAPI, UploadFile
+from fastapi.background import BackgroundTasks
+import openai, tempfile, os, uuid, json
 
-ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
 app = FastAPI()
+JOBS = {}   # in-memory store; use Supabase or Redis later
 
-@app.post("/transcribe")
-async def transcribe(url: str = Form(...)):
-    """Transcribe long YouTube or audio URLs asynchronously."""
+def process_file(job_id: str, path: str):
     try:
-        # 1️⃣ Submit job to AssemblyAI
-        headers = {"authorization": ASSEMBLY_KEY, "content-type": "application/json"}
-        payload = {"audio_url": url}
-        resp = requests.post("https://api.assemblyai.com/v2/transcript", json=payload, headers=headers)
-        job_id = resp.json()["id"]
-
-        # 2️⃣ Poll until done
-        while True:
-            status = requests.get(f"https://api.assemblyai.com/v2/transcript/{job_id}", headers=headers).json()
-            if status["status"] == "completed":
-                transcript = status["text"]
-                break
-            if status["status"] == "error":
-                return {"error": status["error"]}
-            time.sleep(5)  # wait 5 seconds before checking again
-
-        # 3️⃣ Summarize with GPT-5
-        summary_prompt = f"Summarize this transcript in 5 concise bullet points:\n{transcript}"
+        with open(path, "rb") as f:
+            text = openai.audio.transcriptions.create(model="whisper-1", file=f).text
+        summary_prompt = f"Summarize in 5 concise bullet points:\n{text}"
         summary = openai.chat.completions.create(
             model="gpt-5",
             messages=[{"role": "user", "content": summary_prompt}]
         ).choices[0].message.content
-
-        return {"transcript": transcript, "summary": summary}
-
+        JOBS[job_id] = {"status": "complete", "transcript": text, "summary": summary}
     except Exception as e:
-        return {"error": str(e)}
+        JOBS[job_id] = {"status": "error", "error": str(e)}
+
+@app.post("/start_job")
+async def start_job(file: UploadFile, background: BackgroundTasks):
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.write(await file.read())
+    tmp.close()
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "running"}
+    background.add_task(process_file, job_id, tmp.name)
+    return {"job_id": job_id}
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    return JOBS.get(job_id, {"status": "not_found"})
