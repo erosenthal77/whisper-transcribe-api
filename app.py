@@ -1,41 +1,39 @@
-from fastapi import FastAPI, Body
-import openai, tempfile, subprocess, os, shlex
+from fastapi import FastAPI, Form
+import requests, time, openai, os
 
-app = FastAPI()
+ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+app = FastAPI()
+
 @app.post("/transcribe")
-async def transcribe(data: dict = Body(...)):
-    """Accept JSON: { "url": "<youtube link>" }"""
-    url = data.get("url")
-    if not url:
-        return {"error": "Provide a YouTube URL in JSON body, e.g. {'url': 'https://...'}"}
-
+async def transcribe(url: str = Form(...)):
+    """Transcribe long YouTube or audio URLs asynchronously."""
     try:
-        tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        cmd = (
-            f"yt-dlp -x --audio-format mp3 "
-            f"--no-playlist --quiet --no-warnings "
-            f"--max-filesize 50M -o {shlex.quote(tmp_audio.name)} {shlex.quote(url)}"
-        )
-        subprocess.run(cmd, shell=True, timeout=60, check=True)
+        # 1️⃣ Submit job to AssemblyAI
+        headers = {"authorization": ASSEMBLY_KEY, "content-type": "application/json"}
+        payload = {"audio_url": url}
+        resp = requests.post("https://api.assemblyai.com/v2/transcript", json=payload, headers=headers)
+        job_id = resp.json()["id"]
 
-        with open(tmp_audio.name, "rb") as f:
-            transcript = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=f
-            ).text
+        # 2️⃣ Poll until done
+        while True:
+            status = requests.get(f"https://api.assemblyai.com/v2/transcript/{job_id}", headers=headers).json()
+            if status["status"] == "completed":
+                transcript = status["text"]
+                break
+            if status["status"] == "error":
+                return {"error": status["error"]}
+            time.sleep(5)  # wait 5 seconds before checking again
 
+        # 3️⃣ Summarize with GPT-5
+        summary_prompt = f"Summarize this transcript in 5 concise bullet points:\n{transcript}"
         summary = openai.chat.completions.create(
             model="gpt-5",
-            messages=[{"role": "user", "content": f"Summarize this transcript in 5 concise bullets:\n{transcript}"}]
+            messages=[{"role": "user", "content": summary_prompt}]
         ).choices[0].message.content
 
         return {"transcript": transcript, "summary": summary}
 
-    except subprocess.TimeoutExpired:
-        return {"error": "Download timed out — try a shorter clip (<60 s)."}
-    except subprocess.CalledProcessError:
-        return {"error": "YouTube download failed — check the link."}
     except Exception as e:
         return {"error": str(e)}
