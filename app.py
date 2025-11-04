@@ -1,34 +1,36 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, Body
 import openai, tempfile, subprocess, os
 
 app = FastAPI()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = None, url: str = Form(None)):
+async def transcribe(file: UploadFile = None, url: str = Body(None)):
     try:
-        # 1. Download audio if URL
+        # 1️⃣ Determine input source
         if url and not file:
             tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             subprocess.run([
                 "yt-dlp", "-x", "--audio-format", "mp3",
                 "-o", tmp_audio.name, url
-            ])
+            ], check=True)
             audio_path = tmp_audio.name
+        elif file:
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp.write(await file.read())
+            tmp.close()
+            audio_path = tmp.name
         else:
-            tmp_file = tempfile.NamedTemporaryFile(delete=False)
-            tmp_file.write(await file.read())
-            tmp_file.close()
-            audio_path = tmp_file.name
+            return {"error": "Please provide either a file or a YouTube URL."}
 
-        # 2. Whisper transcription
+        # 2️⃣ Transcribe
         with open(audio_path, "rb") as f:
             transcript = openai.audio.transcriptions.create(
                 model="whisper-1",
                 file=f
             ).text
 
-        # 3. GPT summary
+        # 3️⃣ Summarize
         summary_prompt = f"Summarize this transcript in 5 concise bullet points:\n{transcript}"
         summary = openai.chat.completions.create(
             model="gpt-5",
@@ -37,5 +39,7 @@ async def transcribe(file: UploadFile = None, url: str = Form(None)):
 
         return {"transcript": transcript, "summary": summary}
 
+    except subprocess.CalledProcessError as e:
+        return {"error": f"YouTube download failed: {e}"}
     except Exception as e:
         return {"error": str(e)}
